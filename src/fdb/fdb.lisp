@@ -136,6 +136,9 @@ Returns:
 
 - break the data to index into ngrams, starting from 1-grams, then save these
 
+** Sharded counter
+We have a challenge with using shared keys for total-length, which has the length of entries in the index and number-of-documents which has the number of documents in the index. It being a single key, will be read by clients in a concurrent setup, this will lead to retries and blocks, to solve that we use shards, a single key is divided into 16 pieces which will be choosen at random. this gives a good number to prevent delays in the clients. Similar behaviour must be implemented in the fetch function.
+ 
 ** Tips on speed
 This function is generally slow but can be sped up by:
 
@@ -143,11 +146,15 @@ This function is generally slow but can be sped up by:
 - Use concurrent clients, the clients will run in almost the same time for the same operations, if you are doing 1000 operations, a single client might take 25 seconds, while 4 clients doing 4 operations each will take 50 seconds each. Foundationdb is very good at concurrent and parallel operations.
 - Memory engine is slightly faster than SSD, wasn't not much faster in benchmarks."
   ;; we try to put as much work as possible outside the transaction to save on both time and size of it.
+  ;; because of sharing the general stats between documents, like total-length and number of documents, this limits the performace is a
+  ;; concurrent environment, i wonder, how can we make this faster. because it is clearly a bottleneck.
   (let* ((ngrams (generate-substring-counts (tokenize text) ngram-size))
 	 (text-length (length text))
 	 (text-bytes (store nil text))
 	 (1-octets #(1 0 0 0 0 0 0 0))
 	 (-1-octets #(255 255 255 255 255 255 255 255))
+	 (total-length-key (tuple-encode "fts" "stats" "total-length" (format nil "~a" (random 16))))
+	 (number-of-docs-key (tuple-encode "fts" "stats" "number-of-docs" (format nil "~a" (random 16))))
 	 (ngram-range-start-key (apply #'tuple-encode `("fts" "ngrams" "" ,@key)))
 	 (ngram-range-stop-key (apply #'tuple-encode `("fts" "ngrams" #xFF ,@key))))
     (with-transaction (tr *db*)
@@ -162,7 +169,7 @@ This function is generally slow but can be sped up by:
 	(when saved-bytes
 	  (transaction-clear tr ngram-range-start-key ngram-range-stop-key)
 	  ;; this operation is probably inefficient, will optimise later.
-	  (let ((saved-ngrams (mapcar #'car (generate-substring-counts (tokenize (restore saved-bytes)) 1))))
+	  (let ((saved-ngrams (mapcar #'car (generate-substring-counts (tokenize (restore saved-bytes)) ngram-size))))
 	    ;; decrement saved ngrams' df's
 	    ;; we tried using the counters of cl-foundationdb but those were very slow,
 	    ;; so we have resorted to using atomic operations, not that these use little-endian int64 byte arrays
@@ -183,12 +190,12 @@ This function is generally slow but can be sped up by:
 	  ;; if both are equal, no need to run this code, because we will be updating stats wrongly, nothing is changing
 	  (foundationdb::transaction-atomic-operate tr (apply #'tuple-encode `("fts" "stats" "doc-length" ,@key)) l-doc-octets :add)
 	  ;; update the total-length with l-doc
-	  (foundationdb::transaction-atomic-operate tr (tuple-encode "fts" "stats" "total-length") l-doc-octets :add)
+	  (foundationdb::transaction-atomic-operate tr total-length-key l-doc-octets :add)
 	  ;; update the number of docs when there's no old doc
 	  (cond ((null saved-bytes)
-		 (foundationdb::transaction-atomic-operate tr (tuple-encode "fts" "stats" "number-of-docs") 1-octets :add))
+		 (foundationdb::transaction-atomic-operate tr number-of-docs-key 1-octets :add))
 		((string= text "") ;; remove the doc if text is ""
-		 (foundationdb::transaction-atomic-operate tr (tuple-encode "fts" "stats" "number-of-docs") -1-octets :add))))))))
+		 (foundationdb::transaction-atomic-operate tr number-of-docs-key -1-octets :add))))))))
 
 (defun fts-fetch (phrase &key key (ngram-size 3))
   "fetch fts items"
