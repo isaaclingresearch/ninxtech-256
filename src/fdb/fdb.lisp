@@ -6,6 +6,9 @@
   (api-version 100)
   (setq *db* (database-open cluster-file)))
 
+(eval-when (:load-toplevel)
+  (fdb:start-client))
+
 ;; normal key operations
 
 (defun fdb-set (key value)
@@ -120,67 +123,101 @@ Returns:
   (with-transaction (tr *db*)
     (counter-add (make-counter *db* (apply #'tuple-encode `("stats" ,@stats))) tr len)))
 
-(defun fts-index (text &rest key)
-  "Given a value and `&rest` for key values:
+(defun get-total-length ()
+     (with-transaction (tr *db*)
+       (counter-get-transactional (make-counter *db* (tuple-encode "fts" "total-length")) tr)))
 
-- break the data to index into ngrams, starting from 1-grams, then save these"
-  (let* ((ngrams (generate-substring-counts (tokenize text) 1))
+(defun get-number-of-docs ()
+  (with-transaction (tr *db*)
+    (counter-get-transactional (make-counter *db* (tuple-encode "fts" "number-of-docs")) tr)))
+
+(defun fts-index (text &key key (ngram-size 3))
+  "Create an ngram index from the given text with given key, when text = \"\", we are deleting the index entry
+
+- break the data to index into ngrams, starting from 1-grams, then save these
+
+** Tips on speed
+This function is generally slow but can be sped up by:
+
+- Use a larger `ngram-size`, trigrams are good.
+- Use concurrent clients, the clients will run in almost the same time for the same operations, if you are doing 1000 operations, a single client might take 25 seconds, while 4 clients doing 4 operations each will take 50 seconds each. Foundationdb is very good at concurrent and parallel operations.
+- Memory engine is slightly faster than SSD, wasn't not much faster in benchmarks."
+  ;; we try to put as much work as possible outside the transaction to save on both time and size of it.
+  (let* ((ngrams (generate-substring-counts (tokenize text) ngram-size))
 	 (text-length (length text))
 	 (text-bytes (store nil text))
-	 (saved-length (apply #'get-stat `("fts" "doc-length" ,@key)))
-	 (saved-bytes (with-transaction (tr *db*)
-			(future-value (transaction-get tr (apply #'tuple-encode `("fts" "data" ,@key)))))))
-      (with-transaction (tr *db*)
+	 (1-octets #(1 0 0 0 0 0 0 0))
+	 (-1-octets #(255 255 255 255 255 255 255 255))
+	 (ngram-range-start-key (apply #'tuple-encode `("fts" "ngrams" "" ,@key)))
+	 (ngram-range-stop-key (apply #'tuple-encode `("fts" "ngrams" #xFF ,@key))))
+    (with-transaction (tr *db*)
+      ;; first get the data to be used for updates, the length and bytes
+      (let* ((saved-bytes (future-value (transaction-get tr (apply #'tuple-encode `("fts" "data" ,@key)))))
+	     (saved-length-octets (future-value (transaction-get tr (apply #'tuple-encode `("fts" "stats" "doc-length",@key)))))
+	     (saved-length (if (null saved-length-octets) 0 (octets->int64 saved-length-octets)))
+	     ;; localise the text length to a universal one accounting for the saved one
+	     ;; subtract the old from new length
+	     (l-doc-octets (int64->octets (- text-length saved-length))))
+	;; next, if saved, clear the ngrams of this key also, decrement the dfs by one for each saved ngram
 	(when saved-bytes
-	  (transaction-clear tr (apply #'tuple-encode `("fts" "ngrams" "" ,@key))
-			     (tuple-encode "fts" "ngrams" #xFF ,@key))
-	  (let ((saved-ngrams (mapcar #'car (generate-substring-counts (restore saved-bytes)))))
+	  (transaction-clear tr ngram-range-start-key ngram-range-stop-key)
+	  ;; this operation is probably inefficient, will optimise later.
+	  (let ((saved-ngrams (mapcar #'car (generate-substring-counts (tokenize (restore saved-bytes)) 1))))
 	    ;; decrement saved ngrams' df's
+	    ;; we tried using the counters of cl-foundationdb but those were very slow,
+	    ;; so we have resorted to using atomic operations, not that these use little-endian int64 byte arrays
+	    ;; we employ cl-intbytes to do the job, we will replace all counters with this.
+	    ;; but we already know the value of -1 and 1 so we will use directly.
 	    (dolist (ngram saved-ngrams)
-	      (counter-add (make-counter *db* (tuple-encode "fts" "df" ngram) tr -1)))))
+	      (foundationdb::transaction-atomic-operate tr (tuple-encode "fts" "stats" "df" ngram) -1-octets :add))))
+	;; then store the bytes
 	(setf (transaction-get tr (apply #'tuple-encode `("fts" "data" ,@key))) text-bytes)
-		  ;; save ngrams
+	;; save ngrams
 	(dolist (ngram-data ngrams)
 	  (let ((ngram (car ngram-data)))
-	    (counter-add (make-counter *db* (tuple-encode "fts"  "df" ngram)) tr 1)
+	    (foundationdb::transaction-atomic-operate tr (tuple-encode "fts" "stats" "df" ngram) 1-octets :add)
 	    (setf (transaction-get tr (apply #'tuple-encode `("fts" "ngrams" ,ngram ,@key)))
 		  (store nil (cdr ngram-data)))))
+	;; then update the stats used for bm25 computation
 	(unless (equalp text-bytes saved-bytes)
-	  (if saved-bytes
-	      (apply #'incr-stat `(,(- text-length (if (null saved-length) 0 saved-length)) "fts"  "doc-length" ,@key))
-	      (apply #'incr-stat `(,text-length "fts"  "doc-length" ,@key))) ;; for search (bm25)
-	 (apply #'incr-stat `(,(- text-length (if (null saved-length) 0 saved-length)) "fts"  "total-length"))
-	 (when (null saved-bytes)
-	   (counter-add (make-counter *db* (tuple-encode "fts"  "number-of-docs")) tr 1)) ;; for search (bm25)
-	  ))))
+	  ;; if both are equal, no need to run this code, because we will be updating stats wrongly, nothing is changing
+	  (foundationdb::transaction-atomic-operate tr (apply #'tuple-encode `("fts" "stats" "doc-length" ,@key)) l-doc-octets :add)
+	  ;; update the total-length with l-doc
+	  (foundationdb::transaction-atomic-operate tr (tuple-encode "fts" "stats" "total-length") l-doc-octets :add)
+	  ;; update the number of docs when there's no old doc
+	  (cond ((null saved-bytes)
+		 (foundationdb::transaction-atomic-operate tr (tuple-encode "fts" "stats" "number-of-docs") 1-octets :add))
+		((string= text "") ;; remove the doc if text is ""
+		 (foundationdb::transaction-atomic-operate tr (tuple-encode "fts" "stats" "number-of-docs") -1-octets :add))))))))
 
-(defun fts-fetch (phrase &key (page-number 1) key (ngram-size 3))
+(defun fts-fetch (phrase &key key (ngram-size 3))
   "fetch fts items"
   (let* ((ngrams (mapcar #'car (generate-substring-counts (tokenize phrase) ngram-size)))
 	 (bm25 (hash))
 	 (df (hash))
 	 (tf-hash (hash))
 	 (l-doc-hash (hash))
-         (number-of-all-docs (get-stat "fts"  "number-of-docs"))
-	 (l-avg (/ (apply #'get-stat `("fts"  "total-length")) number-of-all-docs))
-	 intersection)
+         number-of-all-docs l-avg intersection)
     ;; fetch dfs within a single transaction
     (with-transaction (tr *db*)
+      (setf number-of-all-docs (octets->int64 (future-value (transaction-get tr (tuple-encode "fts" "stats" "number-of-docs")))))
+      (setf l-avg (/ (octets->int64 (future-value (transaction-get tr (tuple-encode "fts" "stats" "total-length"))))
+		     number-of-all-docs))
       (dolist (ngram ngrams)
 	(setf (gethash ngram df 0)
-	      (counter-get-transactional (make-counter *db* (tuple-encode "fts"  "df" ngram)) tr))))
+	      (octets->int64 (future-value (transaction-get tr (tuple-encode "fts" "stats" "df" ngram)))))))
     ;; fetch matching ngrams
     ;; limit the search
     (with-transaction (tr *db*)
       (dolist (ngram ngrams)
-	(let* ((data (transaction-range-query tr
-					      (apply #'tuple-encode `("fts" "ngrams" ,ngram
-									    ,@(mapcar (lambda (i) "") key)))
-					      (apply #'tuple-encode `("fts" "ngrams" ,ngram
-									    ,@(mapcar (lambda (i) #xFF) key)))
-					      :limit 1000)))
+	;; when fetching the ngrams, what we are doing is fetching all ngrams with a given key,
+	;; so the limits must be applied with the key (#xFF), there's no way to do that in here
+	;; without getting unwmated elements, which means this will be a range starts with
+	;; this part collects the tfs
+	(let* ((data (transaction-range-query tr (range-starts-with (apply #'tuple-encode `("fts" "ngrams" ,ngram ,@key))))))
 	  (setf intersection (union intersection data :test #'equalp :key #'car)))))
-    
+    (print intersection)
+    ;; this part collects the l-docs for given keys and also the tfs with (ngram . key)
     (with-transaction (tr *db*)
       (loop for (key-1 tf) in intersection
 	    do
@@ -193,24 +230,33 @@ Returns:
 		 ;; cache l-doc
 		 (or (gethash key1 l-doc-hash)
 		     (setf (gethash key1 l-doc-hash)
-			   (counter-get-transactional (make-counter *db* (apply #'tuple-encode `("fts"  "doc-length" ,@key1))) tr))))))
+			   (octets->int64 (future-value (transaction-get tr (apply #'tuple-encode `("fts" "stats"  "doc-length" ,@key1))))))))))
     ;; isolate the bm25 calculation from the query loop.
     (loop for (tf-key . tf) in (hash->alist tf-hash)
 	  do (let* ((key1 (cdr tf-key))
 		    (ngram (car tf-key)))
 	       (incf (gethash key1 bm25 0)
 		     (bm25 tf (gethash ngram df) (gethash key1 l-doc-hash) l-avg :n number-of-all-docs))))
-    ;; sort and paginate
-    ;; we currently remove all values < 26.0 to increase accuracy,
-    ;; 26.0 is the value i found to weed out all close but not same results
-    ;; you can improve on this; this doesn't handle spelling errors very well.
-    (let* ((alist (remove-if (lambda (a) (< a 26.0)) (zsort:quicksort (hash->alist bm25) #'> :key #'cdr) :key #'cdr))
-	   (alist-len (length alist))
-	   (page-size 10)
-	   (start-index (* page-size (1- page-number)))
-	   (end-index (min (+ start-index page-size) alist-len))
-	   (sublist (when (< start-index alist-len) (subseq alist start-index end-index))))
+    (let* ((alist (zsort:quicksort (hash->alist bm25) #'> :key #'cdr))
+	   (alist-len (length alist)))
       (cons alist-len (with-transaction (tr *db*)
-			(loop for (kv . bm25) in sublist
+			(loop for (kv . bm25) in alist
 			      collect (let ((data (future-value (transaction-get tr (apply #'tuple-encode `("fts" "data" ,@kv))))))
 					(cons kv (restore data)))))))))
+
+(defun test-fts-index-parrallel ()
+  (mapcar #'sb-thread:join-thread
+	  (loop for i from 0 below 4
+		collect (let ((*db* *db*)
+			 (i i))
+		     (sb-thread:make-thread (lambda () (test-fts-index-loop (* i 25000) (+ 25000 (* i 25000)))))))))
+
+(defun test-fts-index-loop (&optional (start 0) (stop 1000))
+  (loop for i from start to stop
+	do (test-fts-index i)))
+
+(defun test-fts-index (i)
+  (fts-index (format nil "document: ~a, when fetching the ngrams, what we are doing is fetching all ngrams with a given key,
+	so the limits must be applied with the key (#xFF), there's no way to do that in here
+	without getting unwmated elements, which means this will be a range starts with
+	this part collects the tfs" i) :key (list "test" "index" i) :ngram-size 3))

@@ -8,7 +8,7 @@
 		    ;; tests
 		    :fiveam
 		    ;; encode decode utils
-		    :flexi-streams :cl-hash-util :com.inuoe.jzon :babel :split-sequence
+		    :flexi-streams :cl-hash-util :com.inuoe.jzon :babel :split-sequence :cl-intbytes
 		    ;; time utils
 		    :local-time :chronicity
 		    ;; web dev utils
