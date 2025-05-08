@@ -138,6 +138,13 @@ Returns:
 
 ** Sharded counter
 We have a challenge with using shared keys for total-length, which has the length of entries in the index and number-of-documents which has the number of documents in the index. It being a single key, will be read by clients in a concurrent setup, this will lead to retries and blocks, to solve that we use shards, a single key is divided into 16 pieces which will be choosen at random. this gives a good number to prevent delays in the clients. Similar behaviour must be implemented in the fetch function.
+
+** Concurrent access
+Two stat items are used across the entire index, total-length and number-of-docs. This creates a bottleneck for the concurrent access as transactions will lock down both, since with foundationdb we excell via concurrent access, we can't have this.
+
+So we will use a distributed counter. Each index with have a number of shards. A shard is a an element in a array for a given variable, the value is the sum of all members in the array, we will use 16.
+
+Given there are two variables, each will have its own random number to prevent collision even further, because, at scale, even the smallest possibilities become visible.
  
 ** Tips on speed
 This function is generally slow but can be sped up by:
