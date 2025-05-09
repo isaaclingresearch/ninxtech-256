@@ -76,7 +76,9 @@ Full text search layer must be fully extensible to allow you so search using a k
 """
   (inverse-document-frequency function)
   (bm25 function)
+  (similarity function)
   (fts-index function)
+  (fts-index-trgm function)
   (incr-stat function)
   (get-stat function))
 
@@ -131,7 +133,12 @@ Returns:
   (with-transaction (tr *db*)
     (counter-get-transactional (make-counter *db* (tuple-encode "fts" "number-of-docs")) tr)))
 
-(defun fts-index (text &key key (ngram-size 3))
+(defun fts-index (index text &key key (ngram-size 3) (type :trgm))
+  (case type
+    (:trgm (fts-index-trgm index text :key key :ngram-size ngram-size))
+    (:bm25 (fts-index-bm25 text :key key :ngram-size ngram-size))))
+
+(defun fts-index-bm25 (text &key key (ngram-size 3))
   "Create an ngram index from the given text with given key, when text = \"\", we are deleting the index entry
 
 - break the data to index into ngrams, starting from 1-grams, then save these
@@ -204,7 +211,12 @@ This function is generally slow but can be sped up by:
 		((string= text "") ;; remove the doc if text is ""
 		 (foundationdb::transaction-atomic-operate tr number-of-docs-key -1-octets :add))))))))
 
-(defun fts-fetch (phrase &key key (ngram-size 3))
+(defun fts-fetch (index phrase &key (ngram-size 3) (type :trgm))
+  (case type
+    (:trgm (fts-fetch-trgm index phrase :key key :ngram-size ngram-size :type type))
+    (:bm25 (fts-fetch-bm25 phrase :key key :ngram-size ngram-size :type type))))
+
+(defun fts-fetch-bm25 (phrase &key key (ngram-size 3))
   "fetch fts items"
   (let* ((ngrams (mapcar #'car (generate-substring-counts (tokenize phrase) ngram-size)))
 	 (bm25 (hash))
@@ -258,12 +270,80 @@ This function is generally slow but can be sped up by:
 			      collect (let ((data (future-value (transaction-get tr (apply #'tuple-encode `("fts" "data" ,@kv))))))
 					(cons kv (restore data)))))))))
 
+(defun similarity (ngrams-1 ngrams-2 shared-ngrams)
+  "compute the similarity between two texts using their ngrams"
+  (/ shared-ngrams
+     (+ ngrams-1 (- ngrams-2 shared-ngrams))))
+
+(defun make-trigrams (str)
+  (let (lst)
+    (dolist (token (tokenize str)) (setf lst `(,@lst ,@(make-trigrams-1 token))))
+    (remove-duplicates lst :test #'string= :from-end nil)))
+
+(defun make-trigrams-1 (str)
+  (let ((len (length str))
+        (generated-tokens '()))
+    (when (>= len 1)
+      (push (subseq str (- len 1) len) generated-tokens))
+    (when (>= len 2)
+      (push (subseq str (- len 2) len) generated-tokens))
+    (loop for i from (- len 3) downto 0
+          do (push (subseq str i (+ i 3)) generated-tokens))
+    (when (>= len 2)
+      (push (subseq str 0 2) generated-tokens))
+    (when (>= len 1)
+      (push (subseq str 0 1) generated-tokens))
+    (remove-duplicates (nreverse generated-tokens) :test #'string= :from-end nil)))
+
+(defun fts-index-trgm (index text &key key)
+  "Create a trigram index for a given text"
+  (let* ((ngrams (make-trigrams (tokenize text)))
+	 (number-of-ngrams (store nil (length ngrams)))
+	 (text-octets (store nil text)))
+    (with-transaction (tr *db*)
+      (setf (transaction-get tr (apply #'tuple-encode `("fts" "trgm" "length" ,index ,@key))) number-of-ngrams)
+      (setf (transaction-get tr (apply #'tuple-encode `("fts" "trgm" "data" ,index ,@key))) text-octets)
+      (dolist (ngram ngrams)
+	(setf (transaction-get tr (apply #'tuple-encode `("fts" "trgm" "ngrams" ,index ,ngram ,@key))) "")))))
+
+(defun fts-fetch-trgm (index phrase &key (similarity-threshold 0.3))
+  "fetch fts items"
+  (let* ((ngrams (make-trigrams (tokenize phrase)))
+	 (ngrams-2 (length ngrams))
+	 (shared-ngrams (hash))
+	 (similarity (hash))
+	 (doc-lengths (hash)))
+    ;; collect ngrams
+    (dolist (ngram ngrams)
+      (with-transaction (tr *db*)
+	(do-range-query ((key value) tr (range-starts-with (apply #'tuple-encode `("fts" "trgm" "ngrams" ,index ,ngram))))
+	  (declare (ignore value))
+	  (let* ((key-data (foundationdb::tuple-items (tuple-decode key)))
+		 (key1 (subseq (coerce key-data 'list) 5)))
+	    (incf (gethash key1 shared-ngrams 0))))))
+    ;; get doc-lengths
+    (maphash (lambda (k v)
+	       (declare (ignore v))
+	       (with-transaction (tr *db*)
+		 (setf (gethash k doc-lengths) (future-value (transaction-get tr (apply #'tuple-encode `("fts" "trgm" "length" ,index ,@k)))))))
+	     shared-ngrams)
+    ;; get similarities
+    (maphash (lambda (k v)
+	       (setf (gethash k similarity) (similarity (restore (gethash k doc-lengths))
+							  ngrams-2
+	       						  v)))
+	     shared-ngrams)
+    ;; remove all with similarity < 0.3
+    (loop for (k . v) in (remove-if (lambda (i) (< i similarity-threshold)) (hash->alist similarity) :key #'cdr)
+	  collect (with-transaction (tr *db*)
+		    (cons k (restore (future-value (transaction-get tr (apply #'tuple-encode `("fts" "trgm" "data" ,index ,@k))))))))))
+
 (defun test-fts-index-parrallel ()
   (mapcar #'sb-thread:join-thread
 	  (loop for i from 0 below 4
 		collect (let ((*db* *db*)
-			 (i i))
-		     (sb-thread:make-thread (lambda () (test-fts-index-loop (* i 25000) (+ 25000 (* i 25000)))))))))
+			      (i i))
+			  (sb-thread:make-thread (lambda () (test-fts-index-loop (* i 25000) (+ 25000 (* i 25000)))))))))
 
 (defun test-fts-index-loop (&optional (start 0) (stop 1000))
   (loop for i from start to stop
