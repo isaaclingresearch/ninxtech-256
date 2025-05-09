@@ -79,6 +79,9 @@ Full text search layer must be fully extensible to allow you so search using a k
   (similarity function)
   (fts-index function)
   (fts-index-trgm function)
+  (fts-index-bm25 function)
+  (fts-fetch function)
+  (fts-fetch-bm25 function)
   (incr-stat function)
   (get-stat function))
 
@@ -135,10 +138,10 @@ Returns:
 
 (defun fts-index (index text &key key (ngram-size 3) (type :trgm))
   (case type
-    (:trgm (fts-index-trgm index text :key key :ngram-size ngram-size))
-    (:bm25 (fts-index-bm25 text :key key :ngram-size ngram-size))))
+    (:trgm (fts-index-trgm index text :key key))
+    (:bm25 (fts-index-bm25 index text :key key :ngram-size ngram-size))))
 
-(defun fts-index-bm25 (text &key key (ngram-size 3))
+(defun fts-index-bm25 (index text &key key (ngram-size 3))
   "Create an ngram index from the given text with given key, when text = \"\", we are deleting the index entry
 
 - break the data to index into ngrams, starting from 1-grams, then save these
@@ -167,14 +170,14 @@ This function is generally slow but can be sped up by:
 	 (text-bytes (store nil text))
 	 (1-octets #(1 0 0 0 0 0 0 0))
 	 (-1-octets #(255 255 255 255 255 255 255 255))
-	 (total-length-key (tuple-encode "fts" "stats" "total-length" (format nil "~a" (random 16))))
-	 (number-of-docs-key (tuple-encode "fts" "stats" "number-of-docs" (format nil "~a" (random 16))))
-	 (ngram-range-start-key (apply #'tuple-encode `("fts" "ngrams" "" ,@key)))
-	 (ngram-range-stop-key (apply #'tuple-encode `("fts" "ngrams" #xFF ,@key))))
+	 (total-length-key (tuple-encode "fts" "bm25" "stats" "total-length" index (format nil "~a" (random 16))))
+	 (number-of-docs-key (tuple-encode "fts" "bm25" "stats" "number-of-docs" index (format nil "~a" (random 16))))
+	 (ngram-range-start-key (apply #'tuple-encode `("fts" "bm25" "ngrams" ,index "" ,@key)))
+	 (ngram-range-stop-key (apply #'tuple-encode `("fts" "bm25" "ngrams" ,index #xFF ,@key))))
     (with-transaction (tr *db*)
       ;; first get the data to be used for updates, the length and bytes
-      (let* ((saved-bytes (future-value (transaction-get tr (apply #'tuple-encode `("fts" "data" ,@key)))))
-	     (saved-length-octets (future-value (transaction-get tr (apply #'tuple-encode `("fts" "stats" "doc-length",@key)))))
+      (let* ((saved-bytes (future-value (transaction-get tr (apply #'tuple-encode `("fts" "bm25" "data" ,index ,@key)))))
+	     (saved-length-octets (future-value (transaction-get tr (apply #'tuple-encode `("fts" "bm25" "stats" "doc-length",index ,@key)))))
 	     (saved-length (if (null saved-length-octets) 0 (octets->int64 saved-length-octets)))
 	     ;; localise the text length to a universal one accounting for the saved one
 	     ;; subtract the old from new length
@@ -190,20 +193,21 @@ This function is generally slow but can be sped up by:
 	    ;; we employ cl-intbytes to do the job, we will replace all counters with this.
 	    ;; but we already know the value of -1 and 1 so we will use directly.
 	    (dolist (ngram saved-ngrams)
-	      (foundationdb::transaction-atomic-operate tr (tuple-encode "fts" "stats" "df" ngram) -1-octets :add))))
+	      (foundationdb::transaction-atomic-operate tr (tuple-encode "fts" "bm25" "stats" "df" index ngram) -1-octets :add))))
 	;; then store the bytes
-	(setf (transaction-get tr (apply #'tuple-encode `("fts" "data" ,@key))) text-bytes)
+	(setf (transaction-get tr (apply #'tuple-encode `("fts" "bm25" "data" ,index ,@key))) text-bytes)
 	;; save ngrams
 	(dolist (ngram-data ngrams)
 	  (let ((ngram (car ngram-data)))
-	    (foundationdb::transaction-atomic-operate tr (tuple-encode "fts" "stats" "df" ngram) 1-octets :add)
-	    (setf (transaction-get tr (apply #'tuple-encode `("fts" "ngrams" ,ngram ,@key)))
+	    (foundationdb::transaction-atomic-operate tr (tuple-encode "fts" "bm25" "stats" "df" index ngram) 1-octets :add)
+	    (setf (transaction-get tr (apply #'tuple-encode `("fts" "bm25" "ngrams" ,index ,ngram ,@key)))
 		  (store nil (cdr ngram-data)))))
 	;; then update the stats used for bm25 computation
 	(unless (equalp text-bytes saved-bytes)
 	  ;; if both are equal, no need to run this code, because we will be updating stats wrongly, nothing is changing
-	  (foundationdb::transaction-atomic-operate tr (apply #'tuple-encode `("fts" "stats" "doc-length" ,@key)) l-doc-octets :add)
+	  (foundationdb::transaction-atomic-operate tr (apply #'tuple-encode `("fts" "bm25" "stats" "doc-length" ,index ,@key)) l-doc-octets :add)
 	  ;; update the total-length with l-doc
+	  ;; increase concurrency by randomising the total and number of docs here
 	  (foundationdb::transaction-atomic-operate tr total-length-key l-doc-octets :add)
 	  ;; update the number of docs when there's no old doc
 	  (cond ((null saved-bytes)
@@ -213,10 +217,10 @@ This function is generally slow but can be sped up by:
 
 (defun fts-fetch (index phrase &key (ngram-size 3) (type :trgm))
   (case type
-    (:trgm (fts-fetch-trgm index phrase :key key :ngram-size ngram-size :type type))
-    (:bm25 (fts-fetch-bm25 phrase :key key :ngram-size ngram-size :type type))))
+    (:trgm (fts-fetch-trgm index phrase :key key :ngram-size ngram-size))
+    (:bm25 (fts-fetch-bm25 index phrase :key key :ngram-size ngram-size))))
 
-(defun fts-fetch-bm25 (phrase &key key (ngram-size 3))
+(defun fts-fetch-bm25 (index phrase &key key (ngram-size 3))
   "fetch fts items"
   (let* ((ngrams (mapcar #'car (generate-substring-counts (tokenize phrase) ngram-size)))
 	 (bm25 (hash))
@@ -226,12 +230,19 @@ This function is generally slow but can be sped up by:
          number-of-all-docs l-avg intersection)
     ;; fetch dfs within a single transaction
     (with-transaction (tr *db*)
-      (setf number-of-all-docs (octets->int64 (future-value (transaction-get tr (tuple-encode "fts" "stats" "number-of-docs")))))
-      (setf l-avg (/ (octets->int64 (future-value (transaction-get tr (tuple-encode "fts" "stats" "total-length"))))
-		     number-of-all-docs))
+      (setf number-of-all-docs
+	    (reduce #'+ (mapcar (lambda (i) (octets->int64 (cadr i)))
+				(transaction-range-query tr (tuple-encode "fts" "bm25" "stats" "number-of-docs" index "0")
+							 (tuple-encode "fts" "bm25" "stats" "number-of-docs" index "15")))))
+      
+      (setf l-avg (/
+		   (reduce #'+ (mapcar (lambda (i) (octets->int64 (cadr i)))
+				       (transaction-range-query tr (tuple-encode "fts" "bm25" "stats" "total-length" index "0")
+								(tuple-encode "fts" "bm25" "stats" "total-length" index "15"))))
+		   number-of-all-docs))
       (dolist (ngram ngrams)
 	(setf (gethash ngram df 0)
-	      (octets->int64 (future-value (transaction-get tr (tuple-encode "fts" "stats" "df" ngram)))))))
+	      (octets->int64 (future-value (transaction-get tr (tuple-encode "fts" "bm25" "stats" "df" index ngram)))))))
     ;; fetch matching ngrams
     ;; limit the search
     (with-transaction (tr *db*)
@@ -240,9 +251,8 @@ This function is generally slow but can be sped up by:
 	;; so the limits must be applied with the key (#xFF), there's no way to do that in here
 	;; without getting unwmated elements, which means this will be a range starts with
 	;; this part collects the tfs
-	(let* ((data (transaction-range-query tr (range-starts-with (apply #'tuple-encode `("fts" "ngrams" ,ngram ,@key))))))
+	(let* ((data (transaction-range-query tr (range-starts-with (apply #'tuple-encode `("fts" "bm25" "ngrams" ,index ,ngram ,@key))))))
 	  (setf intersection (union intersection data :test #'equalp :key #'car)))))
-    (print intersection)
     ;; this part collects the l-docs for given keys and also the tfs with (ngram . key)
     (with-transaction (tr *db*)
       (loop for (key-1 tf) in intersection
@@ -256,7 +266,8 @@ This function is generally slow but can be sped up by:
 		 ;; cache l-doc
 		 (or (gethash key1 l-doc-hash)
 		     (setf (gethash key1 l-doc-hash)
-			   (octets->int64 (future-value (transaction-get tr (apply #'tuple-encode `("fts" "stats"  "doc-length" ,@key1))))))))))
+			   (octets->int64 (future-value (transaction-get tr (apply #'tuple-encode `("fts" "bm25" "stats"  "doc-length" ,index ,@key1))))))))))
+    (print tf-hash)
     ;; isolate the bm25 calculation from the query loop.
     (loop for (tf-key . tf) in (hash->alist tf-hash)
 	  do (let* ((key1 (cdr tf-key))
@@ -267,7 +278,7 @@ This function is generally slow but can be sped up by:
 	   (alist-len (length alist)))
       (cons alist-len (with-transaction (tr *db*)
 			(loop for (kv . bm25) in alist
-			      collect (let ((data (future-value (transaction-get tr (apply #'tuple-encode `("fts" "data" ,@kv))))))
+			      collect (let ((data (future-value (transaction-get tr (apply #'tuple-encode `("fts" "bm25" "data" ,index ,@kv))))))
 					(cons kv (restore data)))))))))
 
 (defun similarity (ngrams-1 ngrams-2 shared-ngrams)
@@ -283,8 +294,8 @@ This function is generally slow but can be sped up by:
 (defun make-trigrams-1 (str)
   (let ((len (length str))
         (generated-tokens '()))
-    (when (>= len 1)
-      (push (subseq str (- len 1) len) generated-tokens))
+    ;; (when (>= len 1)
+    ;;   (push (subseq str (- len 1) len) generated-tokens))
     (when (>= len 2)
       (push (subseq str (- len 2) len) generated-tokens))
     (loop for i from (- len 3) downto 0
@@ -297,7 +308,7 @@ This function is generally slow but can be sped up by:
 
 (defun fts-index-trgm (index text &key key)
   "Create a trigram index for a given text"
-  (let* ((ngrams (make-trigrams (tokenize text)))
+  (let* ((ngrams (mapcar #'car (generate-substring-counts (tokenize text) 3)))
 	 (number-of-ngrams (store nil (length ngrams)))
 	 (text-octets (store nil text)))
     (with-transaction (tr *db*)
@@ -308,7 +319,7 @@ This function is generally slow but can be sped up by:
 
 (defun fts-fetch-trgm (index phrase &key (similarity-threshold 0.3))
   "fetch fts items"
-  (let* ((ngrams (make-trigrams (tokenize phrase)))
+  (let* ((ngrams (mapcar #'car (generate-substring-counts (tokenize phrase) 3)))
 	 (ngrams-2 (length ngrams))
 	 (shared-ngrams (hash))
 	 (similarity (hash))
@@ -321,18 +332,21 @@ This function is generally slow but can be sped up by:
 	  (let* ((key-data (foundationdb::tuple-items (tuple-decode key)))
 		 (key1 (subseq (coerce key-data 'list) 5)))
 	    (incf (gethash key1 shared-ngrams 0))))))
+    (print shared-ngrams)
     ;; get doc-lengths
     (maphash (lambda (k v)
 	       (declare (ignore v))
 	       (with-transaction (tr *db*)
 		 (setf (gethash k doc-lengths) (future-value (transaction-get tr (apply #'tuple-encode `("fts" "trgm" "length" ,index ,@k)))))))
 	     shared-ngrams)
+    (print doc-lengths)
     ;; get similarities
     (maphash (lambda (k v)
 	       (setf (gethash k similarity) (similarity (restore (gethash k doc-lengths))
-							  ngrams-2
-	       						  v)))
+							ngrams-2
+	       						v)))
 	     shared-ngrams)
+    (print similarity)
     ;; remove all with similarity < 0.3
     (loop for (k . v) in (remove-if (lambda (i) (< i similarity-threshold)) (hash->alist similarity) :key #'cdr)
 	  collect (with-transaction (tr *db*)
@@ -350,7 +364,7 @@ This function is generally slow but can be sped up by:
 	do (test-fts-index i)))
 
 (defun test-fts-index (i)
-  (fts-index (format nil "document: ~a, when fetching the ngrams, what we are doing is fetching all ngrams with a given key,
+  (fts-index "test-trgm" (format nil "document: ~a, when fetching the ngrams, what we are doing is fetching all ngrams with a given key,
 	so the limits must be applied with the key (#xFF), there's no way to do that in here
 	without getting unwmated elements, which means this will be a range starts with
-	this part collects the tfs" i) :key (list "test" "index" i) :ngram-size 3))
+	this part collects the tfs" i) :type :bm25 :key (list (format nil "~a" i)) :ngram-size 3))
