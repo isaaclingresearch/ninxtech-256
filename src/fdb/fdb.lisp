@@ -245,6 +245,7 @@ This function is generally slow but can be sped up by:
 	      (octets->int64 (future-value (transaction-get tr (tuple-encode "fts" "bm25" "stats" "df" index ngram)))))))
     ;; fetch matching ngrams
     ;; limit the search
+    (print (hash->alist df))
     (with-transaction (tr *db*)
       (dolist (ngram ngrams)
 	;; when fetching the ngrams, what we are doing is fetching all ngrams with a given key,
@@ -254,12 +255,13 @@ This function is generally slow but can be sped up by:
 	(let* ((data (transaction-range-query tr (range-starts-with (apply #'tuple-encode `("fts" "bm25" "ngrams" ,index ,ngram ,@key))))))
 	  (setf intersection (union intersection data :test #'equalp :key #'car)))))
     ;; this part collects the l-docs for given keys and also the tfs with (ngram . key)
+    (print df)
     (with-transaction (tr *db*)
       (loop for (key-1 tf) in intersection
 	    do
 	       (let* ((key-data (foundationdb::tuple-items (tuple-decode key-1)))
-		      (key1 (subseq (coerce key-data 'list) 3))
-		      (tf-key (cons (aref key-data 2) key1)))
+		      (key1 (subseq (coerce key-data 'list) 5))
+		      (tf-key (cons (aref key-data 4) key1)))
 		 ;; tf cache
 		 (or (gethash tf-key tf-hash)
 		     (setf (gethash tf-key tf-hash) (restore tf)))
