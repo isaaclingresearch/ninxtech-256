@@ -82,6 +82,7 @@ Full text search layer must be fully extensible to allow you so search using a k
   (fts-index-bm25 function)
   (fts-fetch function)
   (fts-fetch-bm25 function)
+  (fts-fetch-trgm function)
   (incr-stat function)
   (get-stat function))
 
@@ -170,8 +171,8 @@ This function is generally slow but can be sped up by:
 	 (text-bytes (store nil text))
 	 (1-octets #(1 0 0 0 0 0 0 0))
 	 (-1-octets #(255 255 255 255 255 255 255 255))
-	 (total-length-key (tuple-encode "fts" "bm25" "stats" "total-length" index (format nil "~a" (random 16))))
 	 (number-of-docs-key (tuple-encode "fts" "bm25" "stats" "number-of-docs" index (format nil "~a" (random 16))))
+	 (total-length-key (tuple-encode "fts" "bm25" "stats" "total-length" index (format nil "~a" (random 16))))
 	 (ngram-range-start-key (apply #'tuple-encode `("fts" "bm25" "ngrams" ,index "" ,@key)))
 	 (ngram-range-stop-key (apply #'tuple-encode `("fts" "bm25" "ngrams" ,index #xFF ,@key))))
     (with-transaction (tr *db*)
@@ -206,8 +207,6 @@ This function is generally slow but can be sped up by:
 	(unless (equalp text-bytes saved-bytes)
 	  ;; if both are equal, no need to run this code, because we will be updating stats wrongly, nothing is changing
 	  (foundationdb::transaction-atomic-operate tr (apply #'tuple-encode `("fts" "bm25" "stats" "doc-length" ,index ,@key)) l-doc-octets :add)
-	  ;; update the total-length with l-doc
-	  ;; increase concurrency by randomising the total and number of docs here
 	  (foundationdb::transaction-atomic-operate tr total-length-key l-doc-octets :add)
 	  ;; update the number of docs when there's no old doc
 	  (cond ((null saved-bytes)
@@ -220,8 +219,15 @@ This function is generally slow but can be sped up by:
     (:trgm (fts-fetch-trgm index phrase :key key :ngram-size ngram-size))
     (:bm25 (fts-fetch-bm25 index phrase :key key :ngram-size ngram-size))))
 
-(defun fts-fetch-bm25 (index phrase &key key (ngram-size 3))
-  "fetch fts items"
+(defun fts-fetch-bm25 (index phrase &key (key ()) (ngram-size 3))
+  "fetch fts items
+
+** too slow
+fetch is too slow for our needs. foundationdb maybe a great database, but it is not suitable for search over large volumes of data.
+let's try kvrocks with doesn't have foundationdb's limitations.
+
+this marks the end of work on this.
+"
   (let* ((ngrams (mapcar #'car (generate-substring-counts (tokenize phrase) ngram-size)))
 	 (bm25 (hash))
 	 (df (hash))
@@ -234,7 +240,6 @@ This function is generally slow but can be sped up by:
 	    (reduce #'+ (mapcar (lambda (i) (octets->int64 (cadr i)))
 				(transaction-range-query tr (tuple-encode "fts" "bm25" "stats" "number-of-docs" index "0")
 							 (tuple-encode "fts" "bm25" "stats" "number-of-docs" index "15")))))
-      
       (setf l-avg (/
 		   (reduce #'+ (mapcar (lambda (i) (octets->int64 (cadr i)))
 				       (transaction-range-query tr (tuple-encode "fts" "bm25" "stats" "total-length" index "0")
@@ -242,23 +247,25 @@ This function is generally slow but can be sped up by:
 		   number-of-all-docs))
       (dolist (ngram ngrams)
 	(setf (gethash ngram df 0)
-	      (octets->int64 (future-value (transaction-get tr (tuple-encode "fts" "bm25" "stats" "df" index ngram)))))))
+	      (let ((v (future-value (transaction-get tr (tuple-encode "fts" "bm25" "stats" "df" index ngram)))))
+			       (if v (octets->int64 v) 0)))))
     ;; fetch matching ngrams
     ;; limit the search
     (print (hash->alist df))
-    (with-transaction (tr *db*)
-      (dolist (ngram ngrams)
-	;; when fetching the ngrams, what we are doing is fetching all ngrams with a given key,
-	;; so the limits must be applied with the key (#xFF), there's no way to do that in here
-	;; without getting unwmated elements, which means this will be a range starts with
-	;; this part collects the tfs
+    (dolist (ngram ngrams)
+      ;; when fetching the ngrams, what we are doing is fetching all ngrams with a given key,
+      ;; so the limits must be applied with the key (#xFF), there's no way to do that in here
+      ;; without getting unwmated elements, which means this will be a range starts with
+      ;; this part collects the tfs
+      (with-transaction (tr *db*)
+	(transaction-get tr (apply #'tuple-encode `("fts" "bm25" "ngrams" ,index ,ngram ,@key)))
 	(let* ((data (transaction-range-query tr (range-starts-with (apply #'tuple-encode `("fts" "bm25" "ngrams" ,index ,ngram ,@key))))))
 	  (setf intersection (union intersection data :test #'equalp :key #'car)))))
     ;; this part collects the l-docs for given keys and also the tfs with (ngram . key)
     (print df)
-    (with-transaction (tr *db*)
-      (loop for (key-1 tf) in intersection
-	    do
+    (loop for (key-1 tf) in intersection
+	  do
+	     (with-transaction (tr *db*)
 	       (let* ((key-data (foundationdb::tuple-items (tuple-decode key-1)))
 		      (key1 (subseq (coerce key-data 'list) 5))
 		      (tf-key (cons (aref key-data 4) key1)))
@@ -366,7 +373,10 @@ This function is generally slow but can be sped up by:
 	do (test-fts-index i)))
 
 (defun test-fts-index (i)
-  (fts-index "test-trgm" (format nil "document: ~a, when fetching the ngrams, what we are doing is fetching all ngrams with a given key,
+  (fts-index "test-bm25" (format nil "document: ~a, when fetching the ngrams, what we are doing is fetching all ngrams with a given key,
 	so the limits must be applied with the key (#xFF), there's no way to do that in here
 	without getting unwmated elements, which means this will be a range starts with
 	this part collects the tfs" i) :type :bm25 :key (list (format nil "~a" i)) :ngram-size 3))
+
+(defun test-fts-fetch ()
+  (fts-fetch-bm25 "test-trgm" "elements"))
