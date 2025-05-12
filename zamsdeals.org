@@ -1,9 +1,0 @@
-* 30th April, 2025.
-** Zam's deals (zamsdeals.com)
-this is named after my sister Zamzam.
-
-*** Idea
-a classifieds site but with geotagging. each ad is within a range, so when you post an ad, it will be seen within a range, similary,
-when looking for something, it will be with a range.
-
-job we are solving: the job of finding people to do work for you or to buy your things and that of finding things to buy or work to do.

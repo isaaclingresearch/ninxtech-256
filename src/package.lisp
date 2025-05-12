@@ -1,18 +1,7 @@
-(defpackage :zamsdeals.nlp
-  (:use :cl :str :trivia)
-  (:nicknames :nlp)
-  (:shadow str:match)
-  (:documentation "This package for processing text")
-  (:export :remove-punctuation :remove-json-encapsulation :remove-lisp-encapsulation :make-strict-json :tokenize :count-terms :compute-tf :generate-substring-counts))
+(defpackage :256.db
+  (:use :cl :postmodern :s-sql :fiveam))
 
-(defpackage :zamsdeals.fdb
-  (:use :cl :fiveam :trivia :local-time :zamsdeals.nlp :foundationdb :cl-hash-util :cl-binary-store :mgl-pax :babel :zsort :split-sequence
-	:cl-intbytes)
-  (:nicknames :fdb)
-  (:local-nicknames (:store :cl-binary-store) (:hash :cl-hash-util))
-  (:export :save-item :get-autocomplete-terms :search-items :start-client))
-
-(defpackage :zamsdeals
-  (:use :cl :ppcre :com.inuoe.jzon :clog :clog-gui :cl-who :zamsdeals.fdb :cl-hash-util :chronicity)
+(defpackage :256
+  (:use :cl :ppcre :com.inuoe.jzon :cl-who :parenscript :cl-hash-util :chronicity :trivia :clog :mgl-pax)
   (:local-nicknames (:jzon :com.inuoe.jzon) (:ppcre :cl-ppcre))
-  (:shadow clog:escape-string clog:hash chronicity:parse chronicity:span))
+  (:shadow chronicity:parse chronicity:span parenscript:stringify cl-who:escape-string clog:property parenscript:@ parenscript:inner-html parenscript:attribute clog:size clog:hash mgl-pax:writer))
