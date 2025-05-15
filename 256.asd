@@ -23,6 +23,7 @@
 			     (:file "doc")
 			     (:file "db")
 			     (:file "server")
+			     (:file "app")
 			     )))
   :build-operation "program-op" ;; leave as is
   :build-pathname "256"
