@@ -1,15 +1,17 @@
 (in-package :256)
 
+(eval-when (:load-toplevel)
+  )
 ;;; HTTP(S) 
 (setq *show-lisp-errors-p* t) ;; set this to show error files in /priv/errors
 
 ;; define server config
 ;;;; these are set in $HOME/.bashrc to be accessible in the sbcl repl 
-(defvar *256-http-port* (parse-integer (uiop:getenv "256_HTTP_PORT")))
-(defvar *256-https-port* (parse-integer (uiop:getenv "256_HTTPS_PORT")))
-(defvar *256-ssl-cert* (uiop:getenv "256_SSL_CERT"))
-(defvar *256-ssl-key* (uiop:getenv "256_SSL_KEY"))
-(defvar *256-url* (uiop:getenv "256_HOST"))
+(defvar *256-http-port* (parse-integer (uiop:getenv "HTTP_PORT")))
+(defvar *256-https-port* (parse-integer (uiop:getenv "HTTPS_PORT")))
+(defvar *256-ssl-cert* (uiop:getenv "SSL_CERT"))
+(defvar *256-ssl-key* (uiop:getenv "SSL_KEY"))
+(defvar *256-url* (uiop:getenv "HOST"))
 
 ;; SERVER SETUP FUNCTIONS
 
@@ -20,10 +22,10 @@
                         :protocol :https :port *256-https-port*))
 
 (defvar *256-ssl-acceptor* (make-instance 'easy-routes-ssl-acceptor :port *256-https-port*
-								       :ssl-certificate-file *256-ssl-cert*
-								       :ssl-privatekey-file *256-ssl-key*
-								       :document-root (truename "~/common-lisp/256/priv/")
-								       :error-template-directory (truename "~/common-lisp/256/priv/errors/")))
+					  :ssl-certificate-file *256-ssl-cert*
+					  :ssl-privatekey-file *256-ssl-key*
+					  :document-root (truename "~/common-lisp/256/priv/")
+					  :error-template-directory (truename "~/common-lisp/256/priv/errors/")))
 
 (defvar *256-http-acceptor* (make-instance 'http-to-https-acceptor :port *256-http-port*))
 
