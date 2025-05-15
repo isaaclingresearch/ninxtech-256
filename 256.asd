@@ -12,7 +12,7 @@
 		    ;; time utils
 		    :local-time :chronicity
 		    ;; web dev utils
-		    :cl-who :parenscript :clog
+		    :cl-who :parenscript :hunchentoot :easy-routes
 		    ;; storage packages
 		    :postmodern
 		    ;; documentation packages
@@ -22,7 +22,7 @@
 		:components ((:file "package")
 			     (:file "doc")
 			     (:file "db")
-			     (:file "gui")
+			     (:file "server")
 			     )))
   :build-operation "program-op" ;; leave as is
   :build-pathname "256"
